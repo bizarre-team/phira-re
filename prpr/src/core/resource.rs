@@ -592,7 +592,14 @@ impl Resource {
         }
         self.last_vp = vp;
         if !self.no_effect || self.config.sample_count != 1 {
-            self.chart_target = Some(MSRenderTarget::new((vp.2 as u32, vp.3 as u32), self.config.sample_count));
+            #[cfg(target_os = "windows")]
+            let (render_w, render_h) = {
+                let scale = unsafe { get_internal_gl() }.quad_context.dpi_scale();
+                ((vp.2 as f32 * scale) as u32, (vp.3 as f32 * scale) as u32)
+            };
+            #[cfg(not(target_os = "windows"))]
+            let (render_w, render_h) = (vp.2 as u32, vp.3 as u32);
+            self.chart_target = Some(MSRenderTarget::new((render_w, render_h), self.config.sample_count));
         }
         fn viewport(aspect_ratio: f32, (x, y, w, h): (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
             let w = w as f32;

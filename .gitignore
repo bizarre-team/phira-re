@@ -35,8 +35,13 @@ inner.rs
 /test
 /log*
 /build_event_debug.sh
+/phira-mp
 
 
 # OHOS
 
 /phira/dist/
+
+# IDE
+.trae
+.idea

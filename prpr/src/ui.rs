@@ -663,7 +663,17 @@ impl<'a> Ui<'a> {
             stencil: Some(0),
             color: None,
         });
-        let viewport = viewport.unwrap_or_else(|| (0, 0, screen_width() as i32, screen_height() as i32));
+        let viewport = viewport.unwrap_or_else(|| {
+            #[cfg(target_os = "windows")]
+            {
+                let scale = unsafe { get_internal_gl() }.quad_context.dpi_scale();
+                (0, 0, (screen_width() * scale) as i32, (screen_height() * scale) as i32)
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                (0, 0, screen_width() as i32, screen_height() as i32)
+            }
+        });
         Self {
             top: viewport.3 as f32 / viewport.2 as f32,
             viewport,

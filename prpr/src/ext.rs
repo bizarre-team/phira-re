@@ -179,7 +179,17 @@ pub fn get_viewport() -> (i32, i32, i32, i32) {
                 let tex = it.texture(gl.quad_context);
                 (tex.width as i32, tex.height as i32)
             })
-            .unwrap_or_else(|| (screen_width() as _, screen_height() as _));
+            .unwrap_or_else(|| {
+                #[cfg(target_os = "windows")]
+                {
+                    let scale = unsafe { get_internal_gl() }.quad_context.dpi_scale();
+                    ((screen_width() * scale) as i32, (screen_height() * scale) as i32)
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    (screen_width() as _, screen_height() as _)
+                }
+            });
         (0, 0, w, h)
     })
 }
