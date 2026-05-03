@@ -46,11 +46,33 @@ pub struct Config {
     room_id: String,
 }
 
+fn arg_flag(name: &str) -> bool {
+    std::env::args().any(|a| a == name)
+}
+
+fn arg_value(name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    std::env::args().find_map(|a| a.strip_prefix(&prefix).map(str::to_owned))
+}
+
+fn parse_bool_arg(name: &str, default: bool) -> bool {
+    match arg_value(name).as_deref() {
+        Some("true") | Some("1") | Some("yes") => true,
+        Some("false") | Some("0") | Some("no") => false,
+        Some(_) | None => default,
+    }
+}
+
 pub fn build_conf() -> macroquad::window::Conf {
+    let vsync = parse_bool_arg("--vsync", false);
     macroquad::window::Conf {
         window_title: "prpr-monitor".to_string(),
         window_width: 1080,
         window_height: 608,
+        platform: macroquad::miniquad::conf::Platform {
+            swap_interval: Some(if vsync { 1 } else { 0 }),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -79,7 +101,12 @@ async fn the_main() -> Result<()> {
 
     let config: Config = (|| -> Result<Config> { Ok(serde_yaml::from_reader(File::open("monitor-config.yml")?)?) })().context("读取配置失败")?;
 
-    let mut main = Main::new(Box::new(MainScene::new(config.clone()).await?), TimeManager::default(), None).await?;
+    let replay = arg_flag("--replay");
+    if replay {
+        log::info!("--replay 已启用,跳过登录,使用 password 作为 token");
+    }
+
+    let mut main = Main::new(Box::new(MainScene::new(config.clone(), replay).await?), TimeManager::default(), None).await?;
     // main.viewport = Some((0, 100, 500, 500));
 
     let tm = TimeManager::default();

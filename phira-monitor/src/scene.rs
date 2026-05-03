@@ -118,12 +118,6 @@ pub struct PlayerView {
     is_resuming: bool,
 
     // End detection fields
-    /// Number of notes that have been judged so far
-    judged_notes_count: u32,
-
-    // Hold note tracking fields
-    /// Number of notes currently in Hold state (actively being held)
-    active_hold_notes: u32,
     /// Time of the last judge event that was processed
     last_processed_judge_time: f64,
     /// Whether we've ever received judges (to handle initial empty state)
@@ -133,6 +127,9 @@ pub struct PlayerView {
     /// Whether this player has aborted the game
     is_aborted: bool,
 
+    /// Sorted (time, line_idx, note_idx) for non-fake notes; used for early-exit pause detection.
+    sorted_notes: Vec<(f64, u32, u32)>,
+
     // FC/AP state for judge line color
     /// Current judge line color state: 0=perfect(gold), 1=good(blue), 2=white
     fc_ap_state: u8,
@@ -141,15 +138,26 @@ pub struct PlayerView {
 impl PlayerView {
     pub fn new(info: UserInfo, chart: Chart, emitter: ParticleEmitter) -> Self {
         let judge = Judge::new(&chart);
-        // Calculate expected end time from the last note's end time
-        let expected_end_time = chart.lines.iter().flat_map(|line| {
-            line.notes.iter().filter(|n| !n.fake).map(|note| {
-                match &note.kind {
+        // Build sorted note index and compute expected_end_time in a single pass.
+        let mut sorted_notes: Vec<(f64, u32, u32)> = Vec::new();
+        let mut expected_end_time: f64 = 0.0;
+        for (line_idx, line) in chart.lines.iter().enumerate() {
+            for (note_idx, note) in line.notes.iter().enumerate() {
+                if note.fake {
+                    continue;
+                }
+                sorted_notes.push((note.time, line_idx as u32, note_idx as u32));
+                let end = match &note.kind {
                     prpr::core::NoteKind::Hold { end_time, .. } => *end_time,
                     _ => note.time,
+                };
+                if end > expected_end_time {
+                    expected_end_time = end;
                 }
-            })
-        }).fold(0.0, f64::max);
+            }
+        }
+        sorted_notes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        sorted_notes.shrink_to_fit();
         Self {
             id: info.id,
             name: info.name,
@@ -178,13 +186,11 @@ impl PlayerView {
             resume_buffer_start: None,
             is_resuming: false,
 
-            judged_notes_count: 0,
-
-            active_hold_notes: 0,
             last_processed_judge_time: 0.0,
             has_received_judges: false,
             expected_end_time,
             is_aborted: false,
+            sorted_notes,
             fc_ap_state: 0,
         }
     }
@@ -225,92 +231,62 @@ impl PlayerView {
         drop(guard);
     }
 
-    /// Update the active hold note count based on current chart state.
-    fn update_active_hold_notes(&mut self) {
-        self.active_hold_notes = self.chart.lines.iter().map(|line| {
-            line.notes.iter().filter(|note| {
-                matches!(note.judge, JudgeStatus::Hold(_, _, _, _, _))
-            }).count() as u32
-        }).sum();
-    }
-
     /// Check if the player has enough judge data to continue playing.
     /// Returns true if the player should pause.
     ///
-    /// Core logic: We look at the chart state directly. If the current playback time
-    /// has reached a note that should have been judged (based on chart state), but
-    /// the chart shows it's still NotJudged, then the judge is truly missing.
-    /// This correctly handles:
-    /// - Long gaps between notes (no false pause during the gap)
-    /// - Hold notes (we only need a judge at the start time)
-    /// - Near the end of the chart
+    /// Walks through `sorted_notes` (pre-sorted by time) so we can early-exit at
+    /// the first note past the threshold. The first NotJudged note we hit IS the
+    /// earliest missing one, since the iteration order is by time ascending.
     fn should_pause(&self) -> bool {
         // Never pause if game is essentially over (within last 2 seconds)
         if self.local_time >= self.expected_end_time - 2.0 {
             return false;
         }
 
-        // Check chart state directly: find notes that should have been judged by now
-        // but are still NotJudged. This means their judge is truly missing.
-        let mut has_missing_judge = false;
-        let mut earliest_missing_time: Option<f64> = None;
+        let threshold = self.local_time - JUDGE_BUFFER;
 
-        for line in &self.chart.lines {
-            for note in &line.notes {
-                if note.fake {
-                    continue;
-                }
-                // A note needs a judge if:
-                // 1. It's still NotJudged (not processed yet)
-                // 2. Its time has passed (or is very close)
-                if matches!(note.judge, JudgeStatus::NotJudged) {
-                    let note_time = note.time;
-                    // Note needs judge when we're past its time + small buffer
-                    if self.local_time > note_time + JUDGE_BUFFER {
-                        has_missing_judge = true;
-                        if earliest_missing_time.is_none() || note_time < earliest_missing_time.unwrap() {
-                            earliest_missing_time = Some(note_time);
-                        }
-                    }
-                }
+        let mut earliest_missing_time: Option<f64> = None;
+        for &(time, line_idx, note_idx) in &self.sorted_notes {
+            if time > threshold {
+                // Past threshold: nothing later is due yet, so no missing judge.
+                break;
+            }
+            let note = &self.chart.lines[line_idx as usize].notes[note_idx as usize];
+            if matches!(note.judge, JudgeStatus::NotJudged) {
+                earliest_missing_time = Some(time);
+                break;
             }
         }
 
         // If no notes are missing judges, don't pause
-        // This handles:
-        // - All notes up to current time have been judged
-        // - Next note is in the future (long gap, hold note duration, etc.)
-        // - Hold notes (they're in Hold state, not NotJudged)
-        if !has_missing_judge {
+        let Some(missing_time) = earliest_missing_time else {
             return false;
-        }
+        };
 
         // We have a missing judge. Check if it's truly missing or just delayed.
         // If judges queue has events for future notes, the missing one might arrive soon.
-        if let Some(missing_time) = earliest_missing_time {
-            // Check if we have any judges that could be for this note
-            // (judges might arrive out of order or with delay)
-            if let Some(first_judge) = self.judges.front() {
-                let judge_time = first_judge.time as f64;
-                // If the earliest pending judge is for a note AFTER the missing one,
-                // and the missing one is significantly past due, then it's truly missing
-                if judge_time > missing_time + JUDGE_BUFFER {
-                    return true;
-                }
-                // Otherwise, the judge might be arriving soon (out of order or delayed)
-                return false;
+        // Check if we have any judges that could be for this note
+        // (judges might arrive out of order or with delay)
+        if let Some(first_judge) = self.judges.front() {
+            let judge_time = first_judge.time as f64;
+            // If the earliest pending judge is for a note AFTER the missing one,
+            // and the missing one is significantly past due, then it's truly missing
+            if judge_time > missing_time + JUDGE_BUFFER {
+                return true;
             }
+            // Otherwise, the judge might be arriving soon (out of order or delayed)
+            return false;
+        }
 
-            // No judges in queue at all - check if we've been waiting too long
-            if self.has_received_judges && self.last_processed_judge_time > 0.0 {
-                let time_since_last_judge = self.local_time - self.last_processed_judge_time;
-                let time_past_missing = self.local_time - missing_time;
+        // No judges in queue at all - check if we've been waiting too long
+        if self.has_received_judges && self.last_processed_judge_time > 0.0 {
+            let time_since_last_judge = self.local_time - self.last_processed_judge_time;
+            let time_past_missing = self.local_time - missing_time;
 
-                // Pause if:
-                // 1. We're past the missing note time by more than buffer, AND
-                // 2. We've been without any judges for a significant time
-                return time_past_missing > JUDGE_BUFFER && time_since_last_judge > JUDGE_BUFFER;
-            }
+            // Pause if:
+            // 1. We're past the missing note time by more than buffer, AND
+            // 2. We've been without any judges for a significant time
+            return time_past_missing > JUDGE_BUFFER && time_since_last_judge > JUDGE_BUFFER;
         }
 
         false
@@ -421,7 +397,6 @@ impl PlayerView {
             match kind {
                 Ok(tj) => {
                     note.judge = JudgeStatus::Judged;
-                    self.judged_notes_count += 1;
                     let line = &self.chart.lines[event.line_id as usize];
                     let line_tr = line.now_transform(res, &self.chart.lines);
                     let note = &line.notes[event.note_id as usize];
@@ -462,13 +437,9 @@ impl PlayerView {
                 }
                 Err(perfect) => {
                     note.judge = JudgeStatus::Hold(perfect, t, 0., false, f64::INFINITY);
-                    self.active_hold_notes += 1;
                 }
             }
         }
-
-        // Update active hold note count (some may have ended)
-        self.update_active_hold_notes();
 
         // Update FC/AP state based on judge counts
         // State machine: perfect(0) -> good(1) -> white(2), no return
@@ -494,38 +465,42 @@ impl PlayerView {
     }
 
     pub fn render(&mut self, ui: &mut Ui, r: Rect, game_scene: Option<&mut GameScene>, global_now: f64, game_state: MonitorGameState) -> Result<()> {
-        if let Some(scene) = game_scene {
-            // Set the resource time to this player's local time
-            scene.res.time = self.local_time;
-            self.update_with_res_at_time(&mut scene.res, self.local_time);
+        // Aborted players skip the full chart render pipeline (chart.update + scene.render).
+        // The abort overlay covers the tile, so the underlying frame is wasted work.
+        if !self.is_aborted {
+            if let Some(scene) = game_scene {
+                // Set the resource time to this player's local time
+                scene.res.time = self.local_time;
+                self.update_with_res_at_time(&mut scene.res, self.local_time);
 
-            // Apply per-player FC/AP judge line color
-            // Only when the chart line does not have a custom color animation
-            // (chart custom color takes precedence via unwrap_or in line.rs)
-            scene.res.judge_line_color = match self.fc_ap_state {
-                0 => scene.res.res_pack.info.color_perfect(),
-                1 => scene.res.res_pack.info.color_good(),
-                _ => Color::new(1.0, 1.0, 1.0, 1.0),
-            };
+                // Apply per-player FC/AP judge line color
+                // Only when the chart line does not have a custom color animation
+                // (chart custom color takes precedence via unwrap_or in line.rs)
+                scene.res.judge_line_color = match self.fc_ap_state {
+                    0 => scene.res.res_pack.info.color_perfect(),
+                    1 => scene.res.res_pack.info.color_good(),
+                    _ => Color::new(1.0, 1.0, 1.0, 1.0),
+                };
 
-            let r = ui.rect_to_global(r);
-            let vw = screen_width();
-            let x = (r.x + 1.) / 2. * vw;
-            let y = (r.y + ui.top) / 2. * vw;
-            let w = r.w * vw / 2.;
-            let h = r.h * vw / 2.;
-            let mut ui = Ui::new(ui.text_painter, Some((x as _, (screen_height() - y - h) as _, w as _, h as _)));
+                let r = ui.rect_to_global(r);
+                let vw = screen_width();
+                let x = (r.x + 1.) / 2. * vw;
+                let y = (r.y + ui.top) / 2. * vw;
+                let w = r.w * vw / 2.;
+                let h = r.h * vw / 2.;
+                let mut ui = Ui::new(ui.text_painter, Some((x as _, (screen_height() - y - h) as _, w as _, h as _)));
 
-            push_camera_state();
-            self.swap(scene);
-            // Create a temporary TimeManager that reports the player's local time
-            let player_time = self.local_time;
-            let mut player_tm = TimeManager::manual(Box::new(move || player_time));
-            scene.render(&mut player_tm, &mut ui)?;
-            self.swap(scene);
-            pop_camera_state();
+                push_camera_state();
+                self.swap(scene);
+                // Create a temporary TimeManager that reports the player's local time
+                let player_time = self.local_time;
+                let mut player_tm = TimeManager::manual(Box::new(move || player_time));
+                scene.render(&mut player_tm, &mut ui)?;
+                self.swap(scene);
+                pop_camera_state();
 
-            unsafe { get_internal_gl() }.quad_gl.viewport(None);
+                unsafe { get_internal_gl() }.quad_gl.viewport(None);
+            }
         }
 
         // Draw player name (always visible)
@@ -553,8 +528,8 @@ impl PlayerView {
     /// Draw abort indicator overlay with blue styling.
     /// No time information is displayed.
     fn draw_abort_indicator(&self, ui: &mut Ui, r: Rect) {
-        // Semi-transparent dark overlay
-        ui.fill_rect(r, Color::new(0.0, 0.0, 0.0, 0.7));
+        // Full opaque overlay since the chart render is skipped for aborted players.
+        ui.fill_rect(r, Color::new(0.0, 0.0, 0.0, 1.0));
 
         let ct = r.center();
         ui.text("Aborted")
@@ -614,7 +589,7 @@ struct InitResult {
     token: String,
 }
 
-fn create_init_task(config: Config, token: Option<String>) -> Task<Result<InitResult>> {
+fn create_init_task(config: Config, token: Option<String>, replay: bool) -> Task<Result<InitResult>> {
     Task::new(async move {
         #[derive(Serialize)]
         struct LoginP<'a> {
@@ -622,7 +597,9 @@ fn create_init_task(config: Config, token: Option<String>) -> Task<Result<InitRe
             password: &'a str,
         }
 
-        let token = if let Some(token) = token {
+        let token = if replay {
+            token.unwrap_or(config.password.clone())
+        } else if let Some(token) = token {
             token
         } else {
             #[derive(Deserialize)]
@@ -672,6 +649,7 @@ fn create_init_task(config: Config, token: Option<String>) -> Task<Result<InitRe
 pub struct MainScene {
     config: Config,
     client: Option<Arc<Client>>,
+    replay: bool,
 
     token: Option<String>,
     init_task: Option<Task<Result<InitResult>>>,
@@ -708,13 +686,14 @@ pub struct MainScene {
 }
 
 impl MainScene {
-    pub async fn new(config: Config) -> Result<Self> {
+    pub async fn new(config: Config, replay: bool) -> Result<Self> {
         Ok(Self {
             config: config.clone(),
             client: None,
+            replay,
 
             token: None,
-            init_task: Some(create_init_task(config, None)),
+            init_task: Some(create_init_task(config, None, replay)),
             messages: Vec::new(),
 
             scene_task: None,
@@ -1064,7 +1043,7 @@ impl Scene for MainScene {
 
         if ping_fail_count >= 2 && self.init_task.is_none() {
             warn!("lost connection, re-connecting…");
-            self.init_task = Some(create_init_task(self.config.clone(), self.token.clone()));
+            self.init_task = Some(create_init_task(self.config.clone(), self.token.clone(), self.replay));
         }
 
         // Update global time manager for audio
