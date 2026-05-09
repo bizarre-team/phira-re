@@ -106,7 +106,7 @@ async fn the_main() -> Result<()> {
         log::info!("--replay 已启用,跳过登录,使用 password 作为 token");
     }
 
-    let mut main = Main::new(Box::new(MainScene::new(config.clone()).await?), TimeManager::default(), None).await?;
+    let mut main = Main::new(Box::new(MainScene::new(config.clone(), replay).await?), TimeManager::default(), None).await?;
     // main.viewport = Some((0, 100, 500, 500));
 
     let tm = TimeManager::default();

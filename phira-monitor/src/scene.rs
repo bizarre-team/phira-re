@@ -136,20 +136,33 @@ pub struct PlayerView {
     // FC/AP state for judge line color
     /// Current judge line color state: 0=perfect(gold), 1=good(blue), 2=white
     fc_ap_state: u8,
+
+    // Performance optimization: pre-sorted list of non-fake note times
+    /// Sorted list of (time, line_idx, note_idx) for all non-fake notes
+    note_times: Vec<(f64, usize, usize)>,
+    /// Index pointing to the earliest NotJudged note in note_times
+    next_unjudged_idx: usize,
 }
 
 impl PlayerView {
     pub fn new(info: UserInfo, chart: Chart, emitter: ParticleEmitter) -> Self {
         let judge = Judge::new(&chart);
         // Calculate expected end time from the last note's end time
-        let expected_end_time = chart.lines.iter().flat_map(|line| {
-            line.notes.iter().filter(|n| !n.fake).map(|note| {
-                match &note.kind {
-                    prpr::core::NoteKind::Hold { end_time, .. } => *end_time,
-                    _ => note.time,
+        let mut expected_end_time = 0.0f64;
+        let mut note_times = Vec::new();
+        for (line_idx, line) in chart.lines.iter().enumerate() {
+            for (note_idx, note) in line.notes.iter().enumerate() {
+                if !note.fake {
+                    let end_t = match &note.kind {
+                        prpr::core::NoteKind::Hold { end_time, .. } => *end_time,
+                        _ => note.time,
+                    };
+                    expected_end_time = expected_end_time.max(end_t);
+                    note_times.push((note.time, line_idx, note_idx));
                 }
-            })
-        }).fold(0.0, f64::max);
+            }
+        }
+        note_times.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         Self {
             id: info.id,
             name: info.name,
@@ -186,6 +199,8 @@ impl PlayerView {
             expected_end_time,
             is_aborted: false,
             fc_ap_state: 0,
+            note_times,
+            next_unjudged_idx: 0,
         }
     }
 
@@ -225,15 +240,6 @@ impl PlayerView {
         drop(guard);
     }
 
-    /// Update the active hold note count based on current chart state.
-    fn update_active_hold_notes(&mut self) {
-        self.active_hold_notes = self.chart.lines.iter().map(|line| {
-            line.notes.iter().filter(|note| {
-                matches!(note.judge, JudgeStatus::Hold(_, _, _, _, _))
-            }).count() as u32
-        }).sum();
-    }
-
     /// Check if the player has enough judge data to continue playing.
     /// Returns true if the player should pause.
     ///
@@ -250,67 +256,33 @@ impl PlayerView {
             return false;
         }
 
-        // Check chart state directly: find notes that should have been judged by now
-        // but are still NotJudged. This means their judge is truly missing.
-        let mut has_missing_judge = false;
-        let mut earliest_missing_time: Option<f64> = None;
+        // O(1) check using pre-sorted note list
+        let Some((missing_time, _, _)) = self.note_times.get(self.next_unjudged_idx) else {
+            return false; // All notes judged
+        };
 
-        for line in &self.chart.lines {
-            for note in &line.notes {
-                if note.fake {
-                    continue;
-                }
-                // A note needs a judge if:
-                // 1. It's still NotJudged (not processed yet)
-                // 2. Its time has passed (or is very close)
-                if matches!(note.judge, JudgeStatus::NotJudged) {
-                    let note_time = note.time;
-                    // Note needs judge when we're past its time + small buffer
-                    if self.local_time > note_time + JUDGE_BUFFER {
-                        has_missing_judge = true;
-                        if earliest_missing_time.is_none() || note_time < earliest_missing_time.unwrap() {
-                            earliest_missing_time = Some(note_time);
-                        }
-                    }
-                }
-            }
-        }
-
-        // If no notes are missing judges, don't pause
-        // This handles:
-        // - All notes up to current time have been judged
-        // - Next note is in the future (long gap, hold note duration, etc.)
-        // - Hold notes (they're in Hold state, not NotJudged)
-        if !has_missing_judge {
+        // If the next unjudged note is still in the future, no need to pause
+        if *missing_time > self.local_time + JUDGE_BUFFER {
             return false;
         }
 
         // We have a missing judge. Check if it's truly missing or just delayed.
-        // If judges queue has events for future notes, the missing one might arrive soon.
-        if let Some(missing_time) = earliest_missing_time {
-            // Check if we have any judges that could be for this note
-            // (judges might arrive out of order or with delay)
-            if let Some(first_judge) = self.judges.front() {
-                let judge_time = first_judge.time as f64;
-                // If the earliest pending judge is for a note AFTER the missing one,
-                // and the missing one is significantly past due, then it's truly missing
-                if judge_time > missing_time + JUDGE_BUFFER {
-                    return true;
-                }
-                // Otherwise, the judge might be arriving soon (out of order or delayed)
-                return false;
+        if let Some(first_judge) = self.judges.front() {
+            let judge_time = first_judge.time as f64;
+            // If the earliest pending judge is for a note AFTER the missing one,
+            // and the missing one is significantly past due, then it's truly missing
+            if judge_time > missing_time + JUDGE_BUFFER {
+                return true;
             }
+            // Otherwise, the judge might be arriving soon
+            return false;
+        }
 
-            // No judges in queue at all - check if we've been waiting too long
-            if self.has_received_judges && self.last_processed_judge_time > 0.0 {
-                let time_since_last_judge = self.local_time - self.last_processed_judge_time;
-                let time_past_missing = self.local_time - missing_time;
-
-                // Pause if:
-                // 1. We're past the missing note time by more than buffer, AND
-                // 2. We've been without any judges for a significant time
-                return time_past_missing > JUDGE_BUFFER && time_since_last_judge > JUDGE_BUFFER;
-            }
+        // No judges in queue at all - check if we've been waiting too long
+        if self.has_received_judges && self.last_processed_judge_time > 0.0 {
+            let time_since_last_judge = self.local_time - self.last_processed_judge_time;
+            let time_past_missing = self.local_time - missing_time;
+            return time_past_missing > JUDGE_BUFFER && time_since_last_judge > JUDGE_BUFFER;
         }
 
         false
@@ -467,9 +439,6 @@ impl PlayerView {
             }
         }
 
-        // Update active hold note count (some may have ended)
-        self.update_active_hold_notes();
-
         // Update FC/AP state based on judge counts
         // State machine: perfect(0) -> good(1) -> white(2), no return
         let counts = self.judge.counts();
@@ -478,6 +447,15 @@ impl PlayerView {
         }
         if self.fc_ap_state <= 1 && (counts[2] > 0 || counts[3] > 0) {
             self.fc_ap_state = 2; // white
+        }
+
+        // Advance next_unjudged_idx past notes that have been judged
+        while self.next_unjudged_idx < self.note_times.len() {
+            let (_, line_idx, note_idx) = self.note_times[self.next_unjudged_idx];
+            if matches!(self.chart.lines[line_idx].notes[note_idx].judge, JudgeStatus::NotJudged) {
+                break;
+            }
+            self.next_unjudged_idx += 1;
         }
 
         std::mem::swap(&mut self.emitter, &mut res.emitter);
@@ -705,16 +683,25 @@ pub struct MainScene {
     // State machine
     /// Current monitor game state
     monitor_game_state: MonitorGameState,
+
+    // Reusable buffers to avoid per-frame allocations
+    chat_buf: Vec<(i32, String)>,
+    played_buf: Vec<(i32, u32, f32, bool)>,
 }
 
 impl MainScene {
-    pub async fn new(config: Config) -> Result<Self> {
+    pub async fn new(config: Config, replay: bool) -> Result<Self> {
+        let token = if replay {
+            Some(config.password.clone())
+        } else {
+            None
+        };
         Ok(Self {
             config: config.clone(),
             client: None,
 
-            token: None,
-            init_task: Some(create_init_task(config, None)),
+            token: token.clone(),
+            init_task: Some(create_init_task(config, token)),
             messages: Vec::new(),
 
             scene_task: None,
@@ -738,6 +725,8 @@ impl MainScene {
             last_global_time: 0.0,
 
             monitor_game_state: MonitorGameState::Idle,
+            chat_buf: Vec::new(),
+            played_buf: Vec::new(),
         })
     }
 
@@ -746,6 +735,32 @@ impl MainScene {
             info!("Game state transition: {:?} -> {:?}", self.monitor_game_state, new_state);
             self.monitor_game_state = new_state;
         }
+    }
+
+    /// Render all players in a grid layout. Reused for Playing and Ended states.
+    fn render_players(&mut self, ui: &mut Ui, base_r: Rect, global_now: f64) -> Result<()> {
+        let player_count = self.players.len();
+        let (row_count, col_count) = if player_count > 2 {
+            (2, player_count.div_ceil(2))
+        } else {
+            (1, player_count)
+        };
+
+        let cell_r = Rect::new(base_r.x, base_r.y, base_r.w / col_count as f32, base_r.h / row_count as f32);
+        let (w, h) = (cell_r.w.min(cell_r.h * ASPECT_MAX), cell_r.h.min(cell_r.w / ASPECT_MIN));
+        let ct = cell_r.center();
+        let mut iter = self.players.iter_mut();
+        let max_j = iter.len().min(col_count);
+        for i in 0..row_count {
+            for j in 0..max_j {
+                let r = Rect::new(ct.x + j as f32 * cell_r.w, ct.y + i as f32 * cell_r.h, 0., 0.)
+                    .nonuniform_feather(w / 2., h / 2.)
+                    .feather(-0.01);
+                let player = iter.next().unwrap();
+                player.render(ui, r, self.game_scene.as_mut(), global_now, self.monitor_game_state)?;
+            }
+        }
+        Ok(())
     }
 
     fn start_get_ready(&mut self) {
@@ -931,14 +946,14 @@ impl Scene for MainScene {
             Vec::new()
         };
 
-        // Pre-compute user names for Chat/Played messages to avoid client borrow later
-        let mut chat_messages: Vec<(i32, String)> = Vec::new();
-        let mut played_data: Vec<(i32, u32, f32, bool)> = Vec::new();
+        // Reuse buffers to avoid per-frame allocations
+        self.chat_buf.clear();
+        self.played_buf.clear();
 
         for msg in &messages {
             match msg {
                 Message::Chat { user, content, .. } => {
-                    chat_messages.push((*user, content.clone()));
+                    self.chat_buf.push((*user, content.clone()));
                 }
                 Message::SelectChart { id, name, .. } => {
                     self.selected_chart = Some((*id, name.clone()));
@@ -980,6 +995,7 @@ impl Scene for MainScene {
                         player.judges.clear();
                         player.touches.clear();
                         player.fc_ap_state = 0;
+                        player.next_unjudged_idx = 0;
                     }
                 }
                 Message::Played {
@@ -988,7 +1004,7 @@ impl Scene for MainScene {
                     accuracy,
                     full_combo,
                 } => {
-                    played_data.push((*user, *score as u32, *accuracy, *full_combo));
+                    self.played_buf.push((*user, *score as u32, *accuracy, *full_combo));
                 }
                 Message::GameEnd => {
                     self.game_end = true;
@@ -1018,7 +1034,7 @@ impl Scene for MainScene {
         }
 
         // Process Chat messages after the loop to resolve borrow issues
-        for (user_id, content) in chat_messages {
+        for (user_id, content) in self.chat_buf.drain(..) {
             with_client!(self, client, {
                 let user = client.user_name(user_id);
                 info!("[{user}] {content}");
@@ -1027,7 +1043,7 @@ impl Scene for MainScene {
         }
 
         // Process Played messages after the loop to resolve borrow issues
-        for (user_id, score, accuracy, full_combo) in played_data {
+        for (user_id, score, accuracy, full_combo) in self.played_buf.drain(..) {
             with_client!(self, client, {
                 let user = client.user_name(user_id);
                 info!("{user} played: {score} {accuracy} {full_combo}");
@@ -1103,7 +1119,8 @@ impl Scene for MainScene {
         let r = Rect::new(-1., -ui.top, width, ui.top * 2.);
         ui.fill_rect(r, semi_white(0.4));
 
-        match client.blocking_room_state().unwrap() {
+        let room_state = client.blocking_room_state().unwrap();
+        match room_state {
             RoomState::SelectChart(_) => {
                 self.game_scene = None;
                 let ct = r.center();
@@ -1176,54 +1193,13 @@ impl Scene for MainScene {
 
                     }
                     MonitorGameState::Playing => {
-                        // Render all players with their independent local times
-                        // Pause/resume indicators are shown when players are paused
-                        let (row_count, col_count) = if self.players.len() > 2 {
-                            (2, self.players.len().div_ceil(2))
-                        } else {
-                            (1, self.players.len())
-                        };
-
-                        let r = Rect::new(r.x, r.y, r.w / col_count as f32, r.h / row_count as f32);
-                        let (w, h) = (r.w.min(r.h * ASPECT_MAX), r.h.min(r.w / ASPECT_MIN));
-                        let ct = r.center();
-                        let mut iter = self.players.iter_mut();
-                        for i in 0..row_count {
-                            for j in 0..iter.len().min(col_count) {
-                                let r = Rect::new(ct.x + j as f32 * r.w, ct.y + i as f32 * r.h, 0., 0.)
-                                    .nonuniform_feather(w / 2., h / 2.)
-                                    .feather(-0.01);
-                                let player = iter.next().unwrap();
-                                player.render(ui, r, self.game_scene.as_mut(), global_now, self.monitor_game_state)?;
-                            }
-                        }
+                        self.render_players(ui, r, global_now)?;
                     }
                     MonitorGameState::Ended => {
                         // Only render game画面 when room is actually in Playing state
                         // Otherwise show waiting message to prevent stale画面 after game end
-                        let current_room_state = client.blocking_room_state().unwrap();
-                        if matches!(current_room_state, RoomState::Playing) {
-                            // Render all players but force hide pause/resume indicators
-                            // Each player shows "Finished" overlay instead
-                            let (row_count, col_count) = if self.players.len() > 2 {
-                                (2, self.players.len().div_ceil(2))
-                            } else {
-                                (1, self.players.len())
-                            };
-
-                            let r = Rect::new(r.x, r.y, r.w / col_count as f32, r.h / row_count as f32);
-                            let (w, h) = (r.w.min(r.h * ASPECT_MAX), r.h.min(r.w / ASPECT_MIN));
-                            let ct = r.center();
-                            let mut iter = self.players.iter_mut();
-                            for i in 0..row_count {
-                                for j in 0..iter.len().min(col_count) {
-                                    let r = Rect::new(ct.x + j as f32 * r.w, ct.y + i as f32 * r.h, 0., 0.)
-                                        .nonuniform_feather(w / 2., h / 2.)
-                                        .feather(-0.01);
-                                    let player = iter.next().unwrap();
-                                    player.render(ui, r, self.game_scene.as_mut(), global_now, self.monitor_game_state)?;
-                                }
-                            }
+                        if matches!(room_state, RoomState::Playing) {
+                            self.render_players(ui, r, global_now)?;
                         } else {
                             // Room is not in Playing state, show waiting message
                             let ct = r.center();
